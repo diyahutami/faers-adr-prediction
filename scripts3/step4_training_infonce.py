@@ -601,7 +601,7 @@ def train_model(train_graph, val_graph, model: PreciseADR,
     if use_lr_scheduler:
         from torch.optim.lr_scheduler import ReduceLROnPlateau
         scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5,
-                                      patience=20, min_lr=1e-5, verbose=False)
+                                      patience=20, min_lr=1e-5)
 
     best_auc      = -1.0
     best_state    = None
