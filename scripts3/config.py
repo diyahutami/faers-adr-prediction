@@ -242,23 +242,26 @@ GRAPH = {
 
 # ── Model hyperparameters ─────────────────────────────────────────────────
 MODEL = {
-    "embedding_dim"  : 128,          # default: 256  # best: 128  # 256-dim tested: no gain (+0.0005 AUC, more overfitting)
-    "num_hgt_layers" : 2,           # default: 3    # best: 4
-    "num_heads"      : 2,           # default: 4    # best: 2   # 4 heads tested with 256-dim
-    "dropout"        : 0.1,         # default: 0.3  # best: 0.1         
-    "focal_gamma"    : 2.0,         # default: 2.0  # confirmed best (γ=2 Hit@5 +14% vs γ=1)
+    "embedding_dim"  : 256,          # paper value: 256; FAERS_TB best was 128 but FAERS_ALL (200k patients) needs more capacity
+    "num_hgt_layers" : 3,            # paper value: 3
+    "num_heads"      : 4,            # paper value: 4; head_dim = 256/4 = 64
+    "dropout"        : 0.1,         # default: 0.3  # best: 0.1
+    "focal_gamma"    : 2.0,         # confirmed best (γ=2 Hit@5 +14% vs γ=1)
     "batch_size"     : 512,         # default: 512
     "lr"             : 1e-3,        # default: 5e-3 # best: 1e-3
     "weight_decay"   : 0.0,         # NOTE: 1e-4 tested but kills learning (focal gradients too small vs L2 penalty);
                                     #   architecture already regularised via HGT dropout + augmentation dropout
     "max_epochs"     : 300,         # was 500; model never improves past epoch ~50 so 300 is sufficient
     "patience"       : 100,          # was 300 (wasteful); 75 gives headroom past epoch-50 peak without burning GPU
-    "patient_chunk_size": 4096,     # patients per chunk in loss/eval; reduce if OOM (e.g. 1024 for 8GB GPU + 582 ADRs)
-    "use_gradient_checkpointing": True,  # gradient checkpoint HGT layers; required for FAERS_ALL (200k nodes)
-                                         # trades ~2× compute for ~70% less GPU memory (no per-edge activations stored)
+    "patient_chunk_size": 16384,    # patients per chunk in eval; 16384 for RTX 5090 32GB (was 4096 for T4 15GB)
+    "use_gradient_checkpointing": False,  # False on RTX 5090 32GB: saves 2nd GNN forward pass per epoch;
+                                          # set True only for GPUs < 16GB with FAERS_ALL
+    "use_two_pass"   : False,       # False = single-pass training (needs ~4-6GB GPU, fastest);
+                                    # True  = two-pass (OOM-safe for small GPUs, ~2× slower)
+    "use_lr_scheduler": True,       # ReduceLROnPlateau on val_AUC: halves LR after 20 stagnant epochs
     # NEW PARAMETER FOR MODEL_V2
     "edge_drop_prob" : 0.1,
-    "projection_dim" : 128,
+    "projection_dim" : 256,
     "projection_dropout" : 0.1,
     "similarity_threshold": 0.3,  # Jaccard similarity threshold for SupCon positive pairs (30% overlap)
     "alpha_range"    : [0.0, 0.01, 0.05, 0.1, 0.3],   # finer search near 0 where val evidence points
@@ -267,18 +270,18 @@ MODEL = {
     "use_pos_weight" : True,    # weight rare ADRs more heavily in Focal Loss
     "pos_weight_cap" : 50.0,    # clamp max weight (avoids extreme values for ADRs
                                 #   with only 1–2 positives in training)
-    "alpha"          : 0.0,   # default; overridden by grid search
-    # alpha=0.0 outperforms alpha=0.1 on this dataset: with 10k patients and 50 ADRs,
-    # InfoNCE at alpha=0.1 pulls NCE loss to near-zero (0.23), causing contrastive
-    # overfitting (val→test AUC gap 0.024 vs 0.010, Hit@10 0.4606 vs 0.5472).
-    # Use grid search to find optimal alpha across [0.0, 0.1, 0.3, 0.5, 0.7, 0.9].
+    "alpha"          : 0.1,   # re-enabled for FAERS_ALL (200k patients vs 10k TB);
+                               # with large N, InfoNCE contrastive signal is beneficial
+    # alpha=0.0 was best for FAERS_TB (10k patients, 50 ADRs) — contrastive overfitting.
+    # FAERS_ALL (200k patients) has enough diversity for InfoNCE to help.
+    # Use grid search to tune over alpha_range above.
     "tau"            : 0.05,
     # InfoNCE configuration (per paper Equation 10)
     "use_sampled_negatives": False,   # False = exact paper formula (may OOM), True = memory-efficient
     "max_negatives"        : None,   # Maximum negative samples when use_sampled_negatives=True
-    # Memory optimization settings for T4 GPU (15GB)
+    # Memory optimization settings
     "use_amp"              : True,    # Use automatic mixed precision (FP16) training
-    "accumulation_steps"   : 4       # Gradient accumulation steps (increase if still OOM)
+    "accumulation_steps"   : 1        # No accumulation needed on RTX 5090 32GB (was 4 for T4 15GB)
 }
 
 # ── Evaluation ────────────────────────────────────────────────────────────

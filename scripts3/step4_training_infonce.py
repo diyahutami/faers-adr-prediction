@@ -63,30 +63,38 @@ RESULTS_PATH = os.path.join(OUTPUT_PATH, f"results_{DATASET_NAME}_infonce")
 # Global variable to store the seed for reuse
 _GLOBAL_SEED = None
 
-def set_seed(seed: int, verbose: bool = True):
-    """Set random seed for reproducibility across all libraries."""
+def set_seed(seed: int, verbose: bool = True, deterministic: bool = False):
+    """Set random seed for reproducibility across all libraries.
+
+    deterministic : if True, force cuDNN deterministic kernels and
+                    torch.use_deterministic_algorithms(True).  This guarantees
+                    bit-exact reproducibility but serialises CuBLAS operations,
+                    causing 10-30% slowdown on CUDA ≥ 10.2.
+                    Default False → fast non-deterministic kernels (still seeded,
+                    so runs are reproducible within a tolerance of ±1e-5 on GPU).
+    """
     global _GLOBAL_SEED
     _GLOBAL_SEED = seed
-    
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-    # For reproducibility (may reduce performance by ~10-30%)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # Additional PyTorch settings for determinism
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    
-    # Set environment variable for Python hash seed
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        # benchmark=True: cuDNN auto-tunes kernels for fixed-size ops → faster
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
     if verbose:
-        print(f"  Random seed set to: {seed}")
-        print(f"  Note: Deterministic mode enabled (may reduce training speed)")
+        mode = "deterministic (slow)" if deterministic else "non-deterministic (fast)"
+        print(f"  Random seed set to: {seed}  [{mode}]")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper function for JSON serialization
@@ -354,26 +362,24 @@ def run_one_epoch(model: PreciseADR, graph, loss_fn: PreciseADRLoss,
                   optimizer, device: torch.device,
                   is_train: bool = True, scaler=None,
                   accumulation_steps: int = 1,
-                  patient_chunk_size: int = 4096) -> dict:
+                  patient_chunk_size: int = 4096,
+                  use_two_pass: bool = True) -> dict:
     """
-    Two-pass training epoch with gradient-checkpointed GNN and chunked loss.
+    Training epoch with two modes:
 
-    Memory problem with large graphs (FAERS_ALL: 200k patients, millions of edges):
-    HGTConv materialises per-edge attention tensors [num_edges, heads, head_dim]
-    which can be 1 GB per edge-type.  Storing all layers' tensors for backward
-    pushes GPU memory to 6-7 GB before the loss is even computed.
+    use_two_pass=True  (memory-safe, slower — for GPUs < 16 GB with FAERS_ALL):
+      Pass 1 (torch.no_grad): GNN forward → h_patient. No activations stored.
+        Augment/predictor/loss backward runs in chunks accumulating
+        dL/d(h_patient) in h_detached.grad.
+      Pass 2 (with grad + optional gradient checkpointing): Re-run GNN forward,
+        call backward(h_detached.grad) once.
+      Peak GPU memory ≈ 1 GB (checkpoint) or 4-6 GB (no checkpoint).
+      Cost: 2 GNN forward passes per epoch.
 
-    Solution — two passes per epoch:
-      Pass 1 (torch.no_grad): GNN forward → h_patient.
-            No activations stored. Augment/predictor/loss backward runs in
-            chunks (no retain_graph needed; GNN is not in the graph).
-            Accumulates  dL/d(h_patient)  in h_detached.grad.
-      Pass 2 (with grad + gradient checkpointing): Re-run GNN forward.
-            HGT layers use torch.utils.checkpoint so intermediate edge tensors
-            are NOT stored — only layer boundary tensors (~100 MB) are kept.
-            Single backward(h_detached.grad) propagates GNN param gradients.
-    Peak GPU memory ≈ 1 GB (one HGT layer recompute) vs 6-7 GB without this.
-    Cost: 2 GNN forward passes per epoch (vs 1 previously).
+    use_two_pass=False  (single-pass, fastest — for RTX 5090 32 GB):
+      Standard single forward → full-batch loss → single backward.
+      Peak GPU memory ≈ 4-6 GB (GNN activations for 200k patients).
+      Cost: 1 GNN forward pass per epoch (≈ 2× faster than two-pass).
     """
     model.train(is_train)
 
@@ -396,54 +402,73 @@ def run_one_epoch(model: PreciseADR, graph, loss_fn: PreciseADRLoss,
     if is_train:
         optimizer.zero_grad()
 
-        # ── Pass 1: GNN forward with no_grad ─────────────────────────────────
-        # No activation tensors stored → ~100 MB for h_patient only.
-        with torch.no_grad(), amp_ctx:
-            h_patient = model.embed_patients(x_dict, edge_idx_dict, mask)
-
-        # Detach so augment/predictor/loss graph is independent of GNN.
-        h_detached = h_patient.detach().requires_grad_(True)
-        del h_patient   # free; pass 2 will recompute it
-
-        # ── Chunked loss backward (augment + predictor only) ─────────────────
-        # No retain_graph: GNN is not in the computation graph here.
-        for start in range(0, N, patient_chunk_size):
-            end = min(start + patient_chunk_size, N)
+        if not use_two_pass:
+            # ── Single-pass (RTX 5090 / ≥16 GB): standard forward + backward ──
+            # Full batch through GNN → augment → predictor → loss → backward.
+            # Peak memory: GNN layer activations (~4-6 GB) + logits (~350 MB fp16).
+            # ~2× faster than two-pass because there is only one GNN forward.
             with amp_ctx:
-                h_b      = h_detached[start:end]
-                y_b      = y[start:end]
-                h_aug_b  = model.augment(h_b)
-                logits_b = model.predictor(h_aug_b)
-                loss_b, focal_b, nce_b = loss_fn(logits_b, y_b, h_b, h_aug_b)
-                loss_b   = loss_b / n_chunks
+                h_patient = model.embed_patients(x_dict, edge_idx_dict, mask)
+                h_aug     = model.augment(h_patient)
+                logits    = model.predictor(h_aug)
+                loss, focal, nce = loss_fn(logits, y, h_patient, h_aug)
 
-            # Accumulates augment/predictor param grads + h_detached.grad
             if scaler is not None:
-                scaler.scale(loss_b).backward()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss_b.backward()
+                loss.backward()
+                optimizer.step()
 
-            total_loss  += loss_b.item() * n_chunks
-            total_focal += focal_b.item()
-            total_nce   += nce_b.item()
+            total_loss  = loss.item()
+            total_focal = focal.item()
+            total_nce   = nce.item()
 
-        # ── Pass 2: GNN backward via one checkpointed re-forward ─────────────
-        # h_detached.grad holds dL/d(h_patient) accumulated from all chunks.
-        # HGTEncoder.use_checkpoint=True ensures only layer boundaries are
-        # stored during this forward; per-edge attention tensors are recomputed
-        # on-the-fly during backward (see HGTEncoder._conv_step).
-        if h_detached.grad is not None:
-            with amp_ctx:
-                h_patient2 = model.embed_patients(x_dict, edge_idx_dict, mask)
-            # Pass scaled grad straight through; scaler.step() will unscale.
-            h_patient2.backward(h_detached.grad)
-
-        # ── Single optimiser step ─────────────────────────────────────────────
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
         else:
-            optimizer.step()
+            # ── Two-pass (small GPU / OOM-safe) ──────────────────────────────
+
+            # Pass 1: GNN forward with no_grad – no activation tensors stored.
+            with torch.no_grad(), amp_ctx:
+                h_patient = model.embed_patients(x_dict, edge_idx_dict, mask)
+
+            # Detach so augment/predictor/loss graph is independent of GNN.
+            h_detached = h_patient.detach().requires_grad_(True)
+            del h_patient   # free; pass 2 will recompute it
+
+            # Chunked loss backward (augment + predictor only).
+            # No retain_graph: GNN is not in the computation graph here.
+            for start in range(0, N, patient_chunk_size):
+                end = min(start + patient_chunk_size, N)
+                with amp_ctx:
+                    h_b      = h_detached[start:end]
+                    y_b      = y[start:end]
+                    h_aug_b  = model.augment(h_b)
+                    logits_b = model.predictor(h_aug_b)
+                    loss_b, focal_b, nce_b = loss_fn(logits_b, y_b, h_b, h_aug_b)
+                    loss_b   = loss_b / n_chunks
+
+                if scaler is not None:
+                    scaler.scale(loss_b).backward()
+                else:
+                    loss_b.backward()
+
+                total_loss  += loss_b.item() * n_chunks
+                total_focal += focal_b.item()
+                total_nce   += nce_b.item()
+
+            # Pass 2: GNN backward via one checkpointed re-forward.
+            # h_detached.grad holds dL/d(h_patient) accumulated from all chunks.
+            if h_detached.grad is not None:
+                with amp_ctx:
+                    h_patient2 = model.embed_patients(x_dict, edge_idx_dict, mask)
+                h_patient2.backward(h_detached.grad)
+
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
         if device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -463,10 +488,12 @@ def run_one_epoch(model: PreciseADR, graph, loss_fn: PreciseADRLoss,
                 total_focal += focal_b.item()
                 total_nce   += nce_b.item()
 
+    # Normalise: two-pass and eval accumulate per-chunk means; single-pass is already global mean.
+    divisor = 1 if (is_train and not use_two_pass) else n_chunks
     return {
-        "loss"   : total_loss  / n_chunks,
-        "focal"  : total_focal / n_chunks,
-        "infonce": total_nce   / n_chunks,
+        "loss"   : total_loss  / divisor,
+        "focal"  : total_focal / divisor,
+        "infonce": total_nce   / divisor,
     }
 
 
@@ -541,7 +568,9 @@ def train_model(train_graph, val_graph, model: PreciseADR,
                 accumulation_steps: int = 1,
                 pos_weight: torch.Tensor = None,
                 weight_decay: float = 0.0,
-                patient_chunk_size: int = 4096) -> tuple[PreciseADR, dict, dict]:
+                patient_chunk_size: int = 4096,
+                use_two_pass: bool = True,
+                use_lr_scheduler: bool = False) -> tuple[PreciseADR, dict, dict]:
     """
     Train PreciseADR and return (best_model, best_val_metrics, history).
 
@@ -549,8 +578,10 @@ def train_model(train_graph, val_graph, model: PreciseADR,
         use_amp             : Use automatic mixed precision (FP16) training.
         accumulation_steps  : Number of gradient accumulation steps.
         pos_weight          : (n_adrs,) per-class positive weights for FocalLoss.
-        patient_chunk_size  : Patients processed per chunk in loss/eval.
-                              Reduce if OOM on large datasets (default: 4096).
+        patient_chunk_size  : Patients processed per chunk in eval/two-pass loss.
+        use_two_pass        : Two-pass training (OOM-safe); False = single-pass
+                              (requires ~4-6 GB GPU, ~2× faster).
+        use_lr_scheduler    : ReduceLROnPlateau on val_AUC (factor=0.5, patience=20).
     """
     # Reset seed for reproducibility if seed was set
     if _GLOBAL_SEED is not None:
@@ -564,23 +595,34 @@ def train_model(train_graph, val_graph, model: PreciseADR,
     # Initialize gradient scaler for mixed precision training
     amp_scaler = GradScaler() if (use_amp and device.type == 'cuda') else None
 
+    # LR scheduler: halve LR after 20 epochs with no val_AUC improvement.
+    # min_lr=1e-5 prevents LR from collapsing to zero.
+    scheduler = None
+    if use_lr_scheduler:
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5,
+                                      patience=20, min_lr=1e-5, verbose=False)
+
     best_auc      = -1.0
     best_state    = None
     patience_left = patience
 
-    history = {"train_loss": [], "val_auc": []}
+    history = {"train_loss": [], "val_auc": [], "lr": []}
 
     for epoch in range(1, max_epochs + 1):
         train_info = run_one_epoch(model, train_graph, loss_fn, optimizer,
                                    device, is_train=True, scaler=amp_scaler,
                                    accumulation_steps=accumulation_steps,
-                                   patient_chunk_size=patient_chunk_size)
+                                   patient_chunk_size=patient_chunk_size,
+                                   use_two_pass=use_two_pass)
         val_metrics = evaluate(model, val_graph, device,
                                patient_chunk_size=patient_chunk_size)
         val_auc     = val_metrics["AUC"]
+        cur_lr      = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(train_info["loss"])
         history["val_auc"].append(val_auc)
+        history["lr"].append(cur_lr)
 
         if val_auc > best_auc:
             best_auc   = val_auc
@@ -589,10 +631,16 @@ def train_model(train_graph, val_graph, model: PreciseADR,
         else:
             patience_left -= 1
 
+        if scheduler is not None:
+            scheduler.step(val_auc)
+            new_lr = optimizer.param_groups[0]["lr"]
+            if new_lr < cur_lr:
+                print(f"  [LR] reduced {cur_lr:.2e} → {new_lr:.2e} at epoch {epoch}")
+
         if epoch % 10 == 0 or patience_left == 0:
             print(f"  Epoch {epoch:3d} | loss={train_info['loss']:.4f} "
                   f"focal={train_info['focal']:.4f} nce={train_info['infonce']:.4f} "
-                  f"val_AUC={val_auc:.4f} | best={best_auc:.4f}")
+                  f"val_AUC={val_auc:.4f} | best={best_auc:.4f}  lr={cur_lr:.2e}")
 
         if patience_left == 0:
             print(f"  Early stopping at epoch {epoch}")
@@ -651,6 +699,8 @@ def grid_search(train_graph, val_graph, base_model_cfg: dict,
             pos_weight=pos_weight,
             weight_decay=weight_decay,
             patient_chunk_size=base_model_cfg.get("patient_chunk_size", 4096),
+            use_two_pass=base_model_cfg.get("use_two_pass", True),
+            use_lr_scheduler=False,   # no scheduler during grid search (short runs)
         )
         auc = val_metrics["AUC"]
         grid_results[f"a{alpha}_t{tau}"] = {
@@ -753,6 +803,8 @@ def train_variant(variant: str, cfg: dict, graph_path: str,
         pos_weight=pos_weight,
         weight_decay=cfg.get("weight_decay", 0.0),
         patient_chunk_size=cfg.get("patient_chunk_size", 4096),
+        use_two_pass=cfg.get("use_two_pass", True),
+        use_lr_scheduler=cfg.get("use_lr_scheduler", False),
     )
 
     # ── Temperature scaling (post-hoc calibration on val set) ────────────────
@@ -869,6 +921,19 @@ def parse_args():
     p.add_argument("--no-pos-weight", dest="use_pos_weight", action="store_false",
                    help="Disable per-ADR positive weighting (override config.py).")
     p.set_defaults(use_pos_weight=None)  # None = respect config.py
+    # ── Training mode ──────────────────────────────────────────────────────────
+    p.add_argument("--two-pass",    dest="use_two_pass", action="store_true",
+                   default=None,
+                   help="Force two-pass training (OOM-safe for small GPUs). "
+                        "Overrides config.py MODEL['use_two_pass'].")
+    p.add_argument("--no-two-pass", dest="use_two_pass", action="store_false",
+                   help="Force single-pass training (faster, needs ≥16 GB GPU). "
+                        "Overrides config.py MODEL['use_two_pass'].")
+    p.set_defaults(use_two_pass=None)  # None = respect config.py
+    p.add_argument("--deterministic", dest="deterministic", action="store_true",
+                   default=False,
+                   help="Enable cuDNN deterministic mode (bit-exact reproducibility "
+                        "but 10-30%% slower). Default: off (seeded but non-deterministic).")
     return p.parse_args()
 
 
@@ -877,7 +942,7 @@ def main():
 
     # Set random seed if provided
     if args.seed is not None:
-        set_seed(args.seed)
+        set_seed(args.seed, deterministic=args.deterministic)
 
     # ── Apply KG runtime overrides before graph loading ───────────────────────
     if args.use_onsides_adr is not None:
@@ -895,6 +960,9 @@ def main():
     if args.use_pos_weight is not None:
         cfg["use_pos_weight"] = args.use_pos_weight
         print(f"  [CLI override] use_pos_weight = {args.use_pos_weight}")
+    if args.use_two_pass is not None:
+        cfg["use_two_pass"] = args.use_two_pass
+        print(f"  [CLI override] use_two_pass = {args.use_two_pass}")
 
     do_grid    = not args.no_grid_search
     out_suffix = args.out_suffix or ""
